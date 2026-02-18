@@ -5,11 +5,20 @@
 
 [CmdletBinding()]
 param(
-    [string]$PathA = "Z:\",
-    [string]$PathB = "Y:\",
-    [string]$BackupRoot = "Z:\_SyncBackup",
-    [string]$ConflictRoot = "Z:\_SyncConflicts",
-    [string]$LogFile = "Z:\sync_log.txt",
+    # Laufwerke / Wurzelpfade
+    [string]$DriveA = "Z:\",
+    [string]$DriveB = "Y:\",
+
+    # Name des Verzeichnisses, das auf BEIDEN Laufwerken synchronisiert wird
+    # z. B. "Projekte" → synct Z:\Projekte ↔ Y:\Projekte
+    [Parameter(Mandatory = $true)]
+    [string]$FolderName,
+
+    # Backup / Konflikt / Log (werden automatisch auf DriveA angelegt)
+    [string]$BackupRoot,
+    [string]$ConflictRoot,
+    [string]$LogFile,
+
     [int]$MaxRetries = 3,
     [int]$RetryDelaySeconds = 2,
     [int]$BackupRetentionDays = 30,
@@ -18,6 +27,15 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+# ── Pfade zusammenbauen ───────────────────────────────────
+$PathA = Join-Path $DriveA $FolderName
+$PathB = Join-Path $DriveB $FolderName
+
+# Defaults für Backup/Conflict/Log auf DriveA, falls nicht explizit gesetzt
+if (-not $BackupRoot)   { $BackupRoot   = Join-Path $DriveA "_SyncBackup" }
+if (-not $ConflictRoot) { $ConflictRoot = Join-Path $DriveA "_SyncConflicts" }
+if (-not $LogFile)      { $LogFile      = Join-Path $DriveA "sync_log.txt" }
 
 # ── Interne Variablen ──────────────────────────────────────
 $TimeStamp      = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
@@ -334,6 +352,7 @@ $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 Assert-Prerequisites
 
 Write-Log "===== SYNC START ($TimeStamp) ====="
+Write-Log "Sync-Ordner: '$FolderName'"
 Write-Log "PathA=$PathA | PathB=$PathB | Retries=$MaxRetries | Retention=${BackupRetentionDays}d"
 
 try {
