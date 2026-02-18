@@ -5,16 +5,18 @@
 
 [CmdletBinding()]
 param(
-    # Laufwerke / Wurzelpfade
+    # ── VARIANTE 1: Gleicher Ordnername auf beiden Laufwerken ──
+    # Laufwerke angeben + gemeinsamer Ordnername
     [string]$DriveA = "Z:\",
     [string]$DriveB = "Y:\",
-
-    # Name des Verzeichnisses, das auf BEIDEN Laufwerken synchronisiert wird
-    # z. B. "Projekte" → synct Z:\Projekte ↔ Y:\Projekte
-    [Parameter(Mandatory = $true)]
     [string]$FolderName,
 
-    # Backup / Konflikt / Log (werden automatisch auf DriveA angelegt)
+    # ── VARIANTE 2: Unterschiedliche Pfade pro Laufwerk ──
+    # Komplette Pfade direkt angeben (überschreibt DriveA/DriveB/FolderName)
+    [string]$PathA,
+    [string]$PathB,
+
+    # Backup / Konflikt / Log
     [string]$BackupRoot,
     [string]$ConflictRoot,
     [string]$LogFile,
@@ -28,9 +30,32 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# ── Pfade zusammenbauen ───────────────────────────────────
-$PathA = Join-Path $DriveA $FolderName
-$PathB = Join-Path $DriveB $FolderName
+# ── Pfade zusammenbauen / validieren ──────────────────────
+
+if ($PathA -and $PathB) {
+    # Variante 2: Direkte Pfade wurden angegeben → verwenden
+    # DriveA für Backup/Log aus PathA ableiten
+    $DriveA = Split-Path $PathA -Qualifier
+    $DriveA += "\"
+}
+elseif ($FolderName) {
+    # Variante 1: Laufwerk + Ordnername → zusammenbauen
+    $PathA = Join-Path $DriveA $FolderName
+    $PathB = Join-Path $DriveB $FolderName
+}
+else {
+    Write-Host ""
+    Write-Host "FEHLER: Du musst entweder angeben:" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "  Variante 1 (gleicher Ordner):" -ForegroundColor Yellow
+    Write-Host "    .\sync.ps1 -FolderName ""Projekte""" -ForegroundColor Cyan
+    Write-Host "    .\sync.ps1 -FolderName ""Projekte"" -DriveA ""X:\"" -DriveB ""W:\""" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  Variante 2 (unterschiedliche Pfade):" -ForegroundColor Yellow
+    Write-Host "    .\sync.ps1 -PathA ""Z:\Abteilung\Daten"" -PathB ""Y:\Backup\Projekte""" -ForegroundColor Cyan
+    Write-Host ""
+    exit 1
+}
 
 # Defaults für Backup/Conflict/Log auf DriveA, falls nicht explizit gesetzt
 if (-not $BackupRoot)   { $BackupRoot   = Join-Path $DriveA "_SyncBackup" }
@@ -352,7 +377,7 @@ $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 Assert-Prerequisites
 
 Write-Log "===== SYNC START ($TimeStamp) ====="
-Write-Log "Sync-Ordner: '$FolderName'"
+if ($FolderName) { Write-Log "Sync-Ordner: '$FolderName'" }
 Write-Log "PathA=$PathA | PathB=$PathB | Retries=$MaxRetries | Retention=${BackupRetentionDays}d"
 
 try {
