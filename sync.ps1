@@ -57,10 +57,17 @@ else {
     exit 1
 }
 
-# Defaults fuer Backup/Conflict/Log auf DriveA, falls nicht explizit gesetzt
-if (-not $BackupRoot)   { $BackupRoot   = Join-Path $DriveA "_SyncBackup" }
-if (-not $ConflictRoot) { $ConflictRoot = Join-Path $DriveA "_SyncConflicts" }
-if (-not $LogFile)      { $LogFile      = Join-Path $DriveA "sync_log.txt" }
+# Script-Verzeichnis ermitteln (dort landen Backup, Konflikte, Log)
+$ScriptDir = $PSScriptRoot
+if (-not $ScriptDir) {
+    # Fallback wenn per Scriptblock ausgefuehrt (z.B. via .bat Wrapper)
+    $ScriptDir = (Get-Location).Path
+}
+
+# Defaults fuer Backup/Conflict/Log im Script-Verzeichnis, falls nicht explizit gesetzt
+if (-not $BackupRoot)   { $BackupRoot   = Join-Path $ScriptDir "_SyncBackup" }
+if (-not $ConflictRoot) { $ConflictRoot = Join-Path $ScriptDir "_SyncConflicts" }
+if (-not $LogFile)      { $LogFile      = Join-Path $ScriptDir "sync_log.txt" }
 
 # -- Interne Variablen ----------------------------------------
 $TimeStamp      = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
