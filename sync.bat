@@ -8,11 +8,11 @@ REM -- Hier deine Pfade eintragen: --
 set "PATHA=C:\Test"
 set "PATHB=C:\Users\user\scripts\Test"
 
-REM -- Ins Script-Verzeichnis wechseln (fuer Log/Backup-Ablage) --
-cd /d "%~dp0"
+REM -- Script-Verzeichnis (wo diese .bat liegt) --
+set "SCRIPTDIR=%~dp0"
 
 REM -- Script ausfuehren (ohne Execution Policy) --
-powershell.exe -NoProfile -Command "& { $s = Get-Content -Path '%~dp0sync.ps1' -Raw; $sb = [scriptblock]::Create($s); & $sb -PathA '%PATHA%' -PathB '%PATHB%' }"
+powershell.exe -NoProfile -Command "Set-Location '%SCRIPTDIR%'; $s = Get-Content -Path '%SCRIPTDIR%sync.ps1' -Raw; $sb = [scriptblock]::Create($s); & $sb -PathA '%PATHA%' -PathB '%PATHB%'"
 
 echo.
 echo Fertig! (Exit Code: %ERRORLEVEL%)
