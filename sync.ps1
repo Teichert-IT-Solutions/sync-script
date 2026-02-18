@@ -1,18 +1,18 @@
 # ============================================================
-# BIDIREKTIONALER SYNC FÜR NETZLAUFWERKE (Produktionsversion)
+# BIDIREKTIONALER SYNC FUER NETZLAUFWERKE (Produktionsversion)
 # ============================================================
 #Requires -Version 5.1
 
 [CmdletBinding()]
 param(
-    # ── VARIANTE 1: Gleicher Ordnername auf beiden Laufwerken ──
+    # -- VARIANTE 1: Gleicher Ordnername auf beiden Laufwerken --
     # Laufwerke angeben + gemeinsamer Ordnername
     [string]$DriveA = "Z:\",
     [string]$DriveB = "Y:\",
     [string]$FolderName,
 
-    # ── VARIANTE 2: Unterschiedliche Pfade pro Laufwerk ──
-    # Komplette Pfade direkt angeben (überschreibt DriveA/DriveB/FolderName)
+    # -- VARIANTE 2: Unterschiedliche Pfade pro Laufwerk --
+    # Komplette Pfade direkt angeben (ueberschreibt DriveA/DriveB/FolderName)
     [string]$PathA,
     [string]$PathB,
 
@@ -30,16 +30,16 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# ── Pfade zusammenbauen / validieren ──────────────────────
+# -- Pfade zusammenbauen / validieren -------------------------
 
 if ($PathA -and $PathB) {
-    # Variante 2: Direkte Pfade wurden angegeben → verwenden
-    # DriveA für Backup/Log aus PathA ableiten
+    # Variante 2: Direkte Pfade wurden angegeben -> verwenden
+    # DriveA fuer Backup/Log aus PathA ableiten
     $DriveA = Split-Path $PathA -Qualifier
     $DriveA += "\"
 }
 elseif ($FolderName) {
-    # Variante 1: Laufwerk + Ordnername → zusammenbauen
+    # Variante 1: Laufwerk + Ordnername -> zusammenbauen
     $PathA = Join-Path $DriveA $FolderName
     $PathB = Join-Path $DriveB $FolderName
 }
@@ -57,16 +57,16 @@ else {
     exit 1
 }
 
-# Defaults für Backup/Conflict/Log auf DriveA, falls nicht explizit gesetzt
+# Defaults fuer Backup/Conflict/Log auf DriveA, falls nicht explizit gesetzt
 if (-not $BackupRoot)   { $BackupRoot   = Join-Path $DriveA "_SyncBackup" }
 if (-not $ConflictRoot) { $ConflictRoot = Join-Path $DriveA "_SyncConflicts" }
 if (-not $LogFile)      { $LogFile      = Join-Path $DriveA "sync_log.txt" }
 
-# ── Interne Variablen ──────────────────────────────────────
+# -- Interne Variablen ----------------------------------------
 $TimeStamp      = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
 $Stats          = @{ Copied = 0; Updated = 0; Conflicts = 0; Skipped = 0; Errors = 0; Deleted = 0 }
 
-# Ordner, die der Sync selbst nutzt → werden NICHT synchronisiert
+# Ordner, die der Sync selbst nutzt -> werden NICHT synchronisiert
 $ExcludeFolders = @(
     (Split-Path $BackupRoot -Leaf),
     (Split-Path $ConflictRoot -Leaf),
@@ -74,7 +74,7 @@ $ExcludeFolders = @(
     '_SyncConflicts'
 )
 
-# ── Hilfsfunktionen ────────────────────────────────────────
+# -- Hilfsfunktionen ------------------------------------------
 
 function Write-Log {
     param(
@@ -102,7 +102,7 @@ function Get-HashSafe {
         return (Get-FileHash -Algorithm SHA256 -Path $Path -ErrorAction Stop).Hash
     }
     catch {
-        Write-Log "Hash-Berechnung fehlgeschlagen: $Path – $_" -Level WARN
+        Write-Log "Hash-Berechnung fehlgeschlagen: $Path - $_" -Level WARN
         return $null
     }
 }
@@ -133,11 +133,11 @@ function Invoke-WithRetry {
         }
         catch {
             if ($i -lt $MaxRetries) {
-                Write-Log "Retry $i/$MaxRetries für '$Description': $_" -Level WARN
+                Write-Log "Retry $i von $MaxRetries fuer $Description : $_" -Level WARN
                 Start-Sleep -Seconds $RetryDelaySeconds
             }
             else {
-                Write-Log "Fehlgeschlagen nach $MaxRetries Versuchen – '$Description': $_" -Level ERROR
+                Write-Log "Fehlgeschlagen nach $MaxRetries Versuchen - $Description : $_" -Level ERROR
                 $Stats.Errors++
                 return $false
             }
@@ -188,7 +188,7 @@ function Test-IsExcluded {
     return $false
 }
 
-# ── Kern-Sync ──────────────────────────────────────────────
+# -- Kern-Sync -------------------------------------------------
 
 function Sync-Folders {
     param(
@@ -197,7 +197,7 @@ function Sync-Folders {
         [string]$Label
     )
 
-    Write-Log "── Sync $Label : $Source → $Target ──"
+    Write-Log "-- Sync $Label : $Source -> $Target --"
 
     # Sicherstellen, dass Pfade mit Backslash enden
     if (-not $Source.EndsWith('\')) { $Source += '\' }
@@ -207,7 +207,7 @@ function Sync-Folders {
         $files = Get-ChildItem $Source -Recurse -File -ErrorAction Stop
     }
     catch {
-        Write-Log "Kann Quelle nicht lesen: $Source – $_" -Level ERROR
+        Write-Log "Kann Quelle nicht lesen: $Source - $_" -Level ERROR
         $Stats.Errors++
         return
     }
@@ -216,12 +216,12 @@ function Sync-Folders {
 
         $relativePath = $file.FullName.Substring($Source.Length)
 
-        # Ausgeschlossene Ordner überspringen
+        # Ausgeschlossene Ordner ueberspringen
         if (Test-IsExcluded $file.FullName) { continue }
 
-        # Gesperrte Quelldatei überspringen
+        # Gesperrte Quelldatei ueberspringen
         if (Test-FileLocked $file.FullName) {
-            Write-Log "LOCKED (übersprungen): $relativePath" -Level WARN
+            Write-Log "LOCKED (skipped): $relativePath" -Level WARN
             $Stats.Skipped++
             continue
         }
@@ -229,7 +229,7 @@ function Sync-Folders {
         $targetFile = Join-Path $Target $relativePath
 
         if (-not (Test-Path $targetFile)) {
-            # ── Neue Datei → kopieren ──
+            # -- Neue Datei -> kopieren --
             $dir = Split-Path $targetFile
             New-Item -ItemType Directory -Path $dir -Force | Out-Null
 
@@ -242,9 +242,9 @@ function Sync-Folders {
             }
         }
         else {
-            # ── Datei existiert auf beiden Seiten ──
+            # -- Datei existiert auf beiden Seiten --
             if (Test-FileLocked $targetFile) {
-                Write-Log "LOCKED TARGET (übersprungen): $relativePath" -Level WARN
+                Write-Log "LOCKED TARGET (skipped): $relativePath" -Level WARN
                 $Stats.Skipped++
                 continue
             }
@@ -252,9 +252,9 @@ function Sync-Folders {
             $hashSource = Get-HashSafe $file.FullName
             $hashTarget = Get-HashSafe $targetFile
 
-            # Wenn einer der Hashes null ist → Fehler, überspringen
+            # Wenn einer der Hashes null ist -> Fehler, ueberspringen
             if ($null -eq $hashSource -or $null -eq $hashTarget) {
-                Write-Log "HASH FEHLER (übersprungen): $relativePath" -Level WARN
+                Write-Log "HASH ERROR (skipped): $relativePath" -Level WARN
                 $Stats.Skipped++
                 continue
             }
@@ -264,21 +264,21 @@ function Sync-Folders {
                 $timeDiff   = [Math]::Abs(($file.LastWriteTime - $targetItem.LastWriteTime).TotalSeconds)
 
                 if ($timeDiff -lt $ConflictTimeTolerance) {
-                    # Beide fast gleichzeitig geändert → Konflikt
+                    # Beide fast gleichzeitig geaendert -> Konflikt
                     Handle-Conflict $file.FullName $targetFile $relativePath
                 }
                 elseif ($file.LastWriteTime -gt $targetItem.LastWriteTime) {
-                    # Quelle neuer → Ziel aktualisieren
+                    # Quelle neuer -> Ziel aktualisieren
                     Backup-File $targetFile $relativePath
                     $ok = Invoke-WithRetry -Description "Update $relativePath" -Action {
                         Copy-Item $file.FullName $targetFile -Force -ErrorAction Stop
                     }
                     if ($ok) {
-                        Write-Log "UPDATED (Quelle neuer): $relativePath"
+                        Write-Log "UPDATED (Source newer): $relativePath"
                         $Stats.Updated++
                     }
                 }
-                # else: Ziel ist neuer → wird beim Rück-Sync behandelt
+                # else: Ziel ist neuer -> wird beim Rueck-Sync behandelt
             }
         }
     }
@@ -309,9 +309,6 @@ function Remove-OrphanedFiles {
         $sourceFile   = Join-Path $Source $relativePath
 
         if (-not (Test-Path $sourceFile)) {
-            # Prüfen ob die Datei auch in der Gegenrichtung fehlt
-            # (wurde evtl. gerade erst kopiert) → nur entfernen wenn
-            # sie tatsächlich auf KEINER Seite mehr existiert
             $otherSide = if ($Target -eq $PathA) { $PathB } else { $PathA }
             $otherFile = Join-Path $otherSide $relativePath
 
@@ -327,14 +324,14 @@ function Remove-OrphanedFiles {
 
 function Remove-OldBackups {
     <#
-        Löscht Backup-Ordner, die älter als $BackupRetentionDays Tage sind.
+        Loescht Backup-Ordner, die aelter als $BackupRetentionDays Tage sind.
     #>
     if (-not (Test-Path $BackupRoot)) { return }
 
     Get-ChildItem $BackupRoot -Directory | ForEach-Object {
         if ($_.CreationTime -lt (Get-Date).AddDays(-$BackupRetentionDays)) {
             Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
-            Write-Log "BACKUP CLEANUP: $($_.Name) entfernt (älter als $BackupRetentionDays Tage)"
+            Write-Log "BACKUP CLEANUP: $($_.Name) removed (older than $BackupRetentionDays days)"
         }
     }
 
@@ -343,12 +340,12 @@ function Remove-OldBackups {
     Get-ChildItem $ConflictRoot -Directory | ForEach-Object {
         if ($_.CreationTime -lt (Get-Date).AddDays(-$BackupRetentionDays)) {
             Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
-            Write-Log "CONFLICT CLEANUP: $($_.Name) entfernt"
+            Write-Log "CONFLICT CLEANUP: $($_.Name) removed"
         }
     }
 }
 
-# ── Validierung ────────────────────────────────────────────
+# -- Validierung -----------------------------------------------
 
 function Assert-Prerequisites {
     $ok = $true
@@ -362,7 +359,7 @@ function Assert-Prerequisites {
         $ok = $false
     }
     if (-not $ok) {
-        Write-Log "Sync abgebrochen – Voraussetzungen nicht erfüllt." -Level ERROR
+        Write-Log "Sync abgebrochen - Voraussetzungen nicht erfuellt." -Level ERROR
         exit 1
     }
 
@@ -370,26 +367,26 @@ function Assert-Prerequisites {
     New-Item -ItemType Directory -Path $ConflictRoot  -Force | Out-Null
 }
 
-# ── Hauptablauf ────────────────────────────────────────────
+# -- Hauptablauf -----------------------------------------------
 
 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
 Assert-Prerequisites
 
 Write-Log "===== SYNC START ($TimeStamp) ====="
-if ($FolderName) { Write-Log "Sync-Ordner: '$FolderName'" }
+if ($FolderName) { Write-Log "Sync-Ordner: $FolderName" }
 Write-Log "PathA=$PathA | PathB=$PathB | Retries=$MaxRetries | Retention=${BackupRetentionDays}d"
 
 try {
     # Bidirektionaler Sync
-    Sync-Folders -Source $PathA -Target $PathB -Label "A→B"
-    Sync-Folders -Source $PathB -Target $PathA -Label "B→A"
+    Sync-Folders -Source $PathA -Target $PathB -Label "A->B"
+    Sync-Folders -Source $PathB -Target $PathA -Label "B->A"
 
-    # Optional: verwaiste Dateien aufräumen (auskommentiert – bewusst aktivieren!)
+    # Optional: verwaiste Dateien aufraeumen (auskommentiert - bewusst aktivieren!)
     # Remove-OrphanedFiles -Source $PathA -Target $PathB
     # Remove-OrphanedFiles -Source $PathB -Target $PathA
 
-    # Alte Backups aufräumen
+    # Alte Backups aufraeumen
     Remove-OldBackups
 }
 catch {
@@ -400,10 +397,9 @@ catch {
 $stopwatch.Stop()
 $duration = $stopwatch.Elapsed.ToString("hh\:mm\:ss\.fff")
 
-Write-Log ("STATISTIK: Kopiert={0} | Aktualisiert={1} | Konflikte={2} | Übersprungen={3} | Gelöscht={4} | Fehler={5}" -f `
+Write-Log ("STATISTIK: Copied={0} | Updated={1} | Conflicts={2} | Skipped={3} | Deleted={4} | Errors={5}" -f `
     $Stats.Copied, $Stats.Updated, $Stats.Conflicts, $Stats.Skipped, $Stats.Deleted, $Stats.Errors)
 Write-Log "===== SYNC END (Dauer: $duration) ====="
 
 # Exit-Code: 0 = OK, 1 = mit Fehlern
 if ($Stats.Errors -gt 0) { exit 1 } else { exit 0 }
-
