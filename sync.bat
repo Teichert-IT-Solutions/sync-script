@@ -18,5 +18,4 @@ REM pause nur bei manuellem Start (nicht via VBS/Aufgabenplanung)
 if "%1"=="--interactive" (
     echo.
     echo Fertig! (Exit Code: %ERRORLEVEL%)
-    pause
 )
