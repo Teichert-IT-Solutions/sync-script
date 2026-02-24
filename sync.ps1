@@ -226,9 +226,10 @@ function Build-FileIndex {
 
 function Move-ToTrash {
     <#
-        Verschiebt Dateien mit __ (doppeltem Unterstrich) am Anfang des Dateinamens
+        Verschiebt Ordner und Dateien mit __ am Anfang des Namens
         in den Unterordner "Papierkorb" innerhalb des Sync-Verzeichnisses.
-        Gibt die bereinigten Keys zurueck, die aus dem Index entfernt werden muessen.
+        Ordner werden komplett (samt Inhalt) verschoben.
+        Entfernt betroffene Keys aus dem FileIndex.
     #>
     param(
         [string]$SyncRoot,
@@ -238,12 +239,62 @@ function Move-ToTrash {
     if (-not $SyncRoot.EndsWith('\')) { $SyncRoot += '\' }
 
     $trashFolder  = Join-Path $SyncRoot "Papierkorb"
+    $movedFolders = [System.Collections.Generic.List[string]]::new()
+
+    # Phase 1: Ordner mit __ am Anfang komplett verschieben
+    try {
+        $dirs = Get-ChildItem $SyncRoot -Recurse -Directory -ErrorAction Stop |
+                Sort-Object { $_.FullName.Length }
+    }
+    catch {
+        Write-Log "Kann Verzeichnisse nicht lesen: $SyncRoot - $_" -Level WARN
+        $dirs = @()
+    }
+
+    foreach ($dir in $dirs) {
+        if ($dir.FullName.StartsWith($trashFolder)) { continue }
+        if (Test-IsExcluded $dir.FullName) { continue }
+
+        $alreadyMoved = $false
+        foreach ($mf in $movedFolders) {
+            if ($dir.FullName.StartsWith($mf)) { $alreadyMoved = $true; break }
+        }
+        if ($alreadyMoved) { continue }
+
+        if ($dir.Name.StartsWith('__')) {
+            $relativePath = $dir.FullName.Substring($SyncRoot.Length)
+            $trashPath    = Join-Path $trashFolder $relativePath
+            $parentDir    = Split-Path $trashPath
+
+            New-Item -ItemType Directory -Path $parentDir -Force | Out-Null
+
+            $ok = Invoke-WithRetry -Description "Papierkorb (Ordner): $relativePath" -Action {
+                Move-Item $dir.FullName $trashPath -Force -ErrorAction Stop
+            }
+            if ($ok) {
+                Write-Log "PAPIERKORB (Ordner): $relativePath -> Papierkorb/$relativePath"
+                $movedFolders.Add($dir.FullName + '\')
+            }
+        }
+    }
+
+    # Phase 2: Einzelne Dateien mit __ am Anfang verschieben
     $keysToRemove = [System.Collections.Generic.List[string]]::new()
 
     foreach ($entry in $FileIndex.GetEnumerator()) {
         $file = $entry.Value
 
         if ($file.FullName.StartsWith($trashFolder)) { continue }
+
+        # Dateien aus bereits verschobenen Ordnern aus Index entfernen
+        $inMovedFolder = $false
+        foreach ($mf in $movedFolders) {
+            if ($file.FullName.StartsWith($mf)) { $inMovedFolder = $true; break }
+        }
+        if ($inMovedFolder) {
+            $keysToRemove.Add($entry.Key)
+            continue
+        }
 
         if ($file.Name.StartsWith('__')) {
             if (Test-FileLocked $file.FullName) {
@@ -253,9 +304,9 @@ function Move-ToTrash {
 
             $relativePath = $file.FullName.Substring($SyncRoot.Length)
             $trashPath    = Join-Path $trashFolder $relativePath
-            $dir          = Split-Path $trashPath
+            $targetDir    = Split-Path $trashPath
 
-            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
 
             $ok = Invoke-WithRetry -Description "Papierkorb: $relativePath" -Action {
                 Move-Item $file.FullName $trashPath -Force -ErrorAction Stop
