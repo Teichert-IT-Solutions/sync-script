@@ -14,6 +14,9 @@ set "LOGDIR=C:\Users\user\scripts"
 REM -- Script ausfuehren (ohne Execution Policy) --
 powershell.exe -NoProfile -Command "Set-Location '%LOGDIR%'; $s = Get-Content -Path '%~dp0sync.ps1' -Raw; $sb = [scriptblock]::Create($s); & $sb -PathA '%PATHA%' -PathB '%PATHB%'"
 
-echo.
-echo Fertig! (Exit Code: %ERRORLEVEL%)
-pause
+REM pause nur bei manuellem Start (nicht via VBS/Aufgabenplanung)
+if "%1"=="--interactive" (
+    echo.
+    echo Fertig! (Exit Code: %ERRORLEVEL%)
+    pause
+)
