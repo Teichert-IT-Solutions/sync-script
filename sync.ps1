@@ -195,6 +195,61 @@ function Test-IsExcluded {
     return $false
 }
 
+# -- Papierkorb -------------------------------------------------
+
+function Move-ToTrash {
+    <#
+        Verschiebt Dateien mit __ (doppeltem Unterstrich) im Dateinamen
+        in den Unterordner "Papierkorb" innerhalb des Sync-Verzeichnisses.
+        Der Papierkorb-Ordner wird anschliessend ganz normal mitgesynct.
+    #>
+    param(
+        [string]$SyncRoot
+    )
+
+    if (-not $SyncRoot.EndsWith('\')) { $SyncRoot += '\' }
+
+    $trashFolder = Join-Path $SyncRoot "Papierkorb"
+
+    try {
+        $files = Get-ChildItem $SyncRoot -Recurse -File -ErrorAction Stop
+    }
+    catch {
+        Write-Log "Kann Pfad nicht lesen fuer Papierkorb-Pruefung: $SyncRoot - $_" -Level WARN
+        return
+    }
+
+    foreach ($file in $files) {
+        # Dateien, die bereits im Papierkorb liegen, ueberspringen
+        if ($file.FullName.StartsWith($trashFolder)) { continue }
+
+        # Ausgeschlossene Ordner ueberspringen
+        if (Test-IsExcluded $file.FullName) { continue }
+
+        # Gesperrte Dateien ueberspringen
+        if (Test-FileLocked $file.FullName) {
+            Write-Log "LOCKED (Papierkorb skipped): $($file.Name)" -Level WARN
+            continue
+        }
+
+        # Pruefen ob der Dateiname mit __ (doppeltem Unterstrich) beginnt
+        if ($file.Name.StartsWith('__')) {
+            $relativePath = $file.FullName.Substring($SyncRoot.Length)
+            $trashPath    = Join-Path $trashFolder $relativePath
+            $dir          = Split-Path $trashPath
+
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+
+            $ok = Invoke-WithRetry -Description "Papierkorb: $relativePath" -Action {
+                Move-Item $file.FullName $trashPath -Force -ErrorAction Stop
+            }
+            if ($ok) {
+                Write-Log "PAPIERKORB: $relativePath -> Papierkorb/$relativePath"
+            }
+        }
+    }
+}
+
 # -- Kern-Sync -------------------------------------------------
 
 function Sync-Folders {
@@ -385,7 +440,11 @@ if ($FolderName) { Write-Log "Sync-Ordner: $FolderName" }
 Write-Log "PathA=$PathA | PathB=$PathB | Retries=$MaxRetries | Retention=${BackupRetentionDays}d"
 
 try {
-    # Bidirektionaler Sync
+    # Dateien mit __ im Namen in Papierkorb verschieben
+    Move-ToTrash -SyncRoot $PathA
+    Move-ToTrash -SyncRoot $PathB
+
+    # Bidirektionaler Sync (inkl. Papierkorb-Ordner)
     Sync-Folders -Source $PathA -Target $PathB -Label "A->B"
     Sync-Folders -Source $PathB -Target $PathA -Label "B->A"
 
