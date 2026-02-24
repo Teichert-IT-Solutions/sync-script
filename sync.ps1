@@ -188,52 +188,69 @@ function Handle-Conflict {
 function Test-IsExcluded {
     param([string]$FullPath)
     foreach ($folder in $ExcludeFolders) {
-        if ($FullPath -match "(\\|/)$([regex]::Escape($folder))(\\|/|$)") {
+        if ($FullPath.Contains("\$folder\") -or $FullPath.EndsWith("\$folder")) {
             return $true
         }
     }
     return $false
 }
 
+function Build-FileIndex {
+    <#
+        Scannt ein Verzeichnis einmalig und gibt eine Hashtable zurueck:
+        Key = relativer Pfad (lowercase), Value = FileInfo-Objekt.
+        Ausgeschlossene Ordner werden direkt uebersprungen.
+    #>
+    param([string]$Root)
+
+    if (-not $Root.EndsWith('\')) { $Root += '\' }
+    $index = @{}
+
+    try {
+        $files = Get-ChildItem $Root -Recurse -File -ErrorAction Stop
+    }
+    catch {
+        Write-Log "Kann Verzeichnis nicht lesen: $Root - $_" -Level ERROR
+        return $index
+    }
+
+    foreach ($f in $files) {
+        if (Test-IsExcluded $f.FullName) { continue }
+        $rel = $f.FullName.Substring($Root.Length)
+        $index[$rel.ToLower()] = $f
+    }
+    return $index
+}
+
 # -- Papierkorb -------------------------------------------------
 
 function Move-ToTrash {
     <#
-        Verschiebt Dateien mit __ (doppeltem Unterstrich) im Dateinamen
+        Verschiebt Dateien mit __ (doppeltem Unterstrich) am Anfang des Dateinamens
         in den Unterordner "Papierkorb" innerhalb des Sync-Verzeichnisses.
-        Der Papierkorb-Ordner wird anschliessend ganz normal mitgesynct.
+        Gibt die bereinigten Keys zurueck, die aus dem Index entfernt werden muessen.
     #>
     param(
-        [string]$SyncRoot
+        [string]$SyncRoot,
+        [hashtable]$FileIndex
     )
 
     if (-not $SyncRoot.EndsWith('\')) { $SyncRoot += '\' }
 
-    $trashFolder = Join-Path $SyncRoot "Papierkorb"
+    $trashFolder  = Join-Path $SyncRoot "Papierkorb"
+    $keysToRemove = [System.Collections.Generic.List[string]]::new()
 
-    try {
-        $files = Get-ChildItem $SyncRoot -Recurse -File -ErrorAction Stop
-    }
-    catch {
-        Write-Log "Kann Pfad nicht lesen fuer Papierkorb-Pruefung: $SyncRoot - $_" -Level WARN
-        return
-    }
+    foreach ($entry in $FileIndex.GetEnumerator()) {
+        $file = $entry.Value
 
-    foreach ($file in $files) {
-        # Dateien, die bereits im Papierkorb liegen, ueberspringen
         if ($file.FullName.StartsWith($trashFolder)) { continue }
 
-        # Ausgeschlossene Ordner ueberspringen
-        if (Test-IsExcluded $file.FullName) { continue }
-
-        # Gesperrte Dateien ueberspringen
-        if (Test-FileLocked $file.FullName) {
-            Write-Log "LOCKED (Papierkorb skipped): $($file.Name)" -Level WARN
-            continue
-        }
-
-        # Pruefen ob der Dateiname mit __ (doppeltem Unterstrich) beginnt
         if ($file.Name.StartsWith('__')) {
+            if (Test-FileLocked $file.FullName) {
+                Write-Log "LOCKED (Papierkorb skipped): $($file.Name)" -Level WARN
+                continue
+            }
+
             $relativePath = $file.FullName.Substring($SyncRoot.Length)
             $trashPath    = Join-Path $trashFolder $relativePath
             $dir          = Split-Path $trashPath
@@ -245,9 +262,12 @@ function Move-ToTrash {
             }
             if ($ok) {
                 Write-Log "PAPIERKORB: $relativePath -> Papierkorb/$relativePath"
+                $keysToRemove.Add($entry.Key)
             }
         }
     }
+
+    foreach ($k in $keysToRemove) { $FileIndex.Remove($k) }
 }
 
 # -- Kern-Sync -------------------------------------------------
@@ -256,42 +276,31 @@ function Sync-Folders {
     param(
         [string]$Source,
         [string]$Target,
-        [string]$Label
+        [string]$Label,
+        [hashtable]$SourceIndex,
+        [hashtable]$TargetIndex
     )
 
     Write-Log "-- Sync $Label : $Source -> $Target --"
 
-    # Sicherstellen, dass Pfade mit Backslash enden
     if (-not $Source.EndsWith('\')) { $Source += '\' }
     if (-not $Target.EndsWith('\')) { $Target += '\' }
 
-    try {
-        $files = Get-ChildItem $Source -Recurse -File -ErrorAction Stop
-    }
-    catch {
-        Write-Log "Kann Quelle nicht lesen: $Source - $_" -Level ERROR
-        $Stats.Errors++
-        return
-    }
-
-    foreach ($file in $files) {
-
+    foreach ($entry in $SourceIndex.GetEnumerator()) {
+        $relKey  = $entry.Key
+        $file    = $entry.Value
         $relativePath = $file.FullName.Substring($Source.Length)
-
-        # Ausgeschlossene Ordner ueberspringen
-        if (Test-IsExcluded $file.FullName) { continue }
-
-        # Gesperrte Quelldatei ueberspringen
-        if (Test-FileLocked $file.FullName) {
-            Write-Log "LOCKED (skipped): $relativePath" -Level WARN
-            $Stats.Skipped++
-            continue
-        }
 
         $targetFile = Join-Path $Target $relativePath
 
-        if (-not (Test-Path $targetFile)) {
+        if (-not $TargetIndex.ContainsKey($relKey)) {
             # -- Neue Datei -> kopieren --
+            if (Test-FileLocked $file.FullName) {
+                Write-Log "LOCKED (skipped): $relativePath" -Level WARN
+                $Stats.Skipped++
+                continue
+            }
+
             $dir = Split-Path $targetFile
             New-Item -ItemType Directory -Path $dir -Force | Out-Null
 
@@ -305,6 +314,20 @@ function Sync-Folders {
         }
         else {
             # -- Datei existiert auf beiden Seiten --
+            $targetItem = $TargetIndex[$relKey]
+
+            # Fast-Path: Groesse und LastWriteTime identisch -> keine Aenderung
+            if ($file.Length -eq $targetItem.Length -and
+                [Math]::Abs(($file.LastWriteTime - $targetItem.LastWriteTime).TotalSeconds) -lt 1) {
+                continue
+            }
+
+            # Groesse oder Zeit unterschiedlich -> genauer pruefen
+            if (Test-FileLocked $file.FullName) {
+                Write-Log "LOCKED (skipped): $relativePath" -Level WARN
+                $Stats.Skipped++
+                continue
+            }
             if (Test-FileLocked $targetFile) {
                 Write-Log "LOCKED TARGET (skipped): $relativePath" -Level WARN
                 $Stats.Skipped++
@@ -314,7 +337,6 @@ function Sync-Folders {
             $hashSource = Get-HashSafe $file.FullName
             $hashTarget = Get-HashSafe $targetFile
 
-            # Wenn einer der Hashes null ist -> Fehler, ueberspringen
             if ($null -eq $hashSource -or $null -eq $hashTarget) {
                 Write-Log "HASH ERROR (skipped): $relativePath" -Level WARN
                 $Stats.Skipped++
@@ -322,15 +344,12 @@ function Sync-Folders {
             }
 
             if ($hashSource -ne $hashTarget) {
-                $targetItem = Get-Item $targetFile
-                $timeDiff   = [Math]::Abs(($file.LastWriteTime - $targetItem.LastWriteTime).TotalSeconds)
+                $timeDiff = [Math]::Abs(($file.LastWriteTime - $targetItem.LastWriteTime).TotalSeconds)
 
                 if ($timeDiff -lt $ConflictTimeTolerance) {
-                    # Beide fast gleichzeitig geaendert -> Konflikt
                     Handle-Conflict $file.FullName $targetFile $relativePath
                 }
                 elseif ($file.LastWriteTime -gt $targetItem.LastWriteTime) {
-                    # Quelle neuer -> Ziel aktualisieren
                     Backup-File $targetFile $relativePath
                     $ok = Invoke-WithRetry -Description "Update $relativePath" -Action {
                         Copy-Item $file.FullName $targetFile -Force -ErrorAction Stop
@@ -340,7 +359,6 @@ function Sync-Folders {
                         $Stats.Updated++
                     }
                 }
-                # else: Ziel ist neuer -> wird beim Rueck-Sync behandelt
             }
         }
     }
@@ -440,13 +458,22 @@ if ($FolderName) { Write-Log "Sync-Ordner: $FolderName" }
 Write-Log "PathA=$PathA | PathB=$PathB | Retries=$MaxRetries | Retention=${BackupRetentionDays}d"
 
 try {
-    # Dateien mit __ im Namen in Papierkorb verschieben
-    Move-ToTrash -SyncRoot $PathA
-    Move-ToTrash -SyncRoot $PathB
+    # Beide Seiten einmalig scannen und indexieren
+    Write-Log "Scanne Verzeichnis A: $PathA"
+    $indexA = Build-FileIndex -Root $PathA
+    Write-Log "Index A: $($indexA.Count) Dateien"
 
-    # Bidirektionaler Sync (inkl. Papierkorb-Ordner)
-    Sync-Folders -Source $PathA -Target $PathB -Label "A->B"
-    Sync-Folders -Source $PathB -Target $PathA -Label "B->A"
+    Write-Log "Scanne Verzeichnis B: $PathB"
+    $indexB = Build-FileIndex -Root $PathB
+    Write-Log "Index B: $($indexB.Count) Dateien"
+
+    # Dateien mit __ im Namen in Papierkorb verschieben (entfernt Keys aus Index)
+    Move-ToTrash -SyncRoot $PathA -FileIndex $indexA
+    Move-ToTrash -SyncRoot $PathB -FileIndex $indexB
+
+    # Bidirektionaler Sync mit vorberechneten Indizes
+    Sync-Folders -Source $PathA -Target $PathB -Label "A->B" -SourceIndex $indexA -TargetIndex $indexB
+    Sync-Folders -Source $PathB -Target $PathA -Label "B->A" -SourceIndex $indexB -TargetIndex $indexA
 
     # Optional: verwaiste Dateien aufraeumen (auskommentiert - bewusst aktivieren!)
     # Remove-OrphanedFiles -Source $PathA -Target $PathB
