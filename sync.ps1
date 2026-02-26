@@ -81,6 +81,16 @@ $ExcludeFolders = @(
     '_SyncConflicts'
 )
 
+# Dateien, die nie synchronisiert/verschoben/gesichert werden sollen
+$ExcludeFileNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$ExcludeFileNames.Add('sync_log.txt') | Out-Null
+if ($LogFile) {
+    $logLeaf = Split-Path $LogFile -Leaf
+    if (-not [string]::IsNullOrWhiteSpace($logLeaf)) {
+        $ExcludeFileNames.Add($logLeaf) | Out-Null
+    }
+}
+
 # -- Hilfsfunktionen ------------------------------------------
 
 function Write-Log {
@@ -157,6 +167,8 @@ function Backup-File {
         [string]$FilePath,
         [string]$RelativePath
     )
+    if (Test-IsExcluded $FilePath) { return }
+
     $backupPath = Join-Path $BackupRoot "$TimeStamp\$RelativePath"
     $dir = Split-Path $backupPath
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
@@ -187,6 +199,12 @@ function Handle-Conflict {
 
 function Test-IsExcluded {
     param([string]$FullPath)
+
+    $leaf = Split-Path $FullPath -Leaf
+    if ($ExcludeFileNames.Contains($leaf)) {
+        return $true
+    }
+
     foreach ($folder in $ExcludeFolders) {
         if ($FullPath.Contains("\$folder\") -or $FullPath.EndsWith("\$folder")) {
             return $true
