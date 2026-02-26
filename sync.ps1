@@ -570,12 +570,8 @@ function Sync-Folders {
             }
 
             if ($hashSource -ne $hashTarget) {
-                $timeDiff = [Math]::Abs(($file.LastWriteTime - $targetItem.LastWriteTime).TotalSeconds)
-
-                if ($timeDiff -lt $ConflictTimeTolerance) {
-                    Handle-Conflict $file.FullName $targetFile $relativePath
-                }
-                elseif ($file.LastWriteTime -gt $targetItem.LastWriteTime) {
+                # Neuere Version gewinnt immer. Nur bei identischer Zeit bleibt es ein echter Konflikt.
+                if ($file.LastWriteTime -gt $targetItem.LastWriteTime) {
                     Backup-File $targetFile $relativePath
                     $ok = Invoke-WithRetry -Description "Update $relativePath" -Action {
                         Copy-Item $file.FullName $targetFile -Force -ErrorAction Stop
@@ -584,6 +580,13 @@ function Sync-Folders {
                         Write-Log "UPDATED (Source newer): $relativePath"
                         $Stats.Updated++
                     }
+                }
+                elseif ($targetItem.LastWriteTime -gt $file.LastWriteTime) {
+                    # Target ist neuer -> wird im Gegenlauf (B->A bzw. A->B) uebernommen
+                    continue
+                }
+                else {
+                    Handle-Conflict $file.FullName $targetFile $relativePath
                 }
             }
         }
