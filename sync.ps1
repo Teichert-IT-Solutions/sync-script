@@ -542,10 +542,15 @@ function Sync-Folders {
             # -- Datei existiert auf beiden Seiten --
             $targetItem = $TargetIndex[$relKey]
 
-            # Fast-Path: Groesse und LastWriteTime identisch -> keine Aenderung
+            # Fast-Path nur noch bei exakt gleicher Zeit.
+            # Bei "nahezu gleich" (z.B. gleiche Sekunde) kann Inhalt trotzdem abweichen.
             if ($file.Length -eq $targetItem.Length -and
-                [Math]::Abs(($file.LastWriteTime - $targetItem.LastWriteTime).TotalSeconds) -lt 1) {
-                continue
+                $file.LastWriteTimeUtc -eq $targetItem.LastWriteTimeUtc) {
+                $hashSourceFast = Get-HashSafe $file.FullName
+                $hashTargetFast = Get-HashSafe $targetFile
+                if ($null -ne $hashSourceFast -and $hashSourceFast -eq $hashTargetFast) {
+                    continue
+                }
             }
 
             # Groesse oder Zeit unterschiedlich -> genauer pruefen
