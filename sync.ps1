@@ -224,6 +224,130 @@ function Build-FileIndex {
 
 # -- Papierkorb -------------------------------------------------
 
+function Get-UnmarkedRelativePath {
+    <#
+        Entfernt genau ein fuehrendes "__" vom Dateinamen/Ordnernamen
+        des letzten Pfadsegments.
+    #>
+    param([string]$RelativePath)
+
+    $leaf = Split-Path -Path $RelativePath -Leaf
+    if (-not $leaf.StartsWith('__')) { return $null }
+
+    $unmarkedLeaf = $leaf.Substring(2)
+    if ([string]::IsNullOrWhiteSpace($unmarkedLeaf)) { return $null }
+
+    $parent = Split-Path -Path $RelativePath -Parent
+    if ([string]::IsNullOrEmpty($parent) -or $parent -eq '.') {
+        return $unmarkedLeaf
+    }
+    return (Join-Path $parent $unmarkedLeaf)
+}
+
+function Invoke-RemoteTrashFromMarkers {
+    <#
+        Erkennt "__"-Marker auf einer Seite und verschiebt die passende
+        Datei/den passenden Ordner auf der Gegenseite in den Papierkorb.
+        Der Name auf der Gegenseite wird dabei ebenfalls mit "__" markiert.
+    #>
+    param(
+        [string]$MarkerRoot,
+        [string]$OtherRoot,
+        [hashtable]$MarkerIndex,
+        [hashtable]$OtherIndex,
+        [string]$Label = ""
+    )
+
+    if (-not $MarkerRoot.EndsWith('\')) { $MarkerRoot += '\' }
+    if (-not $OtherRoot.EndsWith('\'))  { $OtherRoot  += '\' }
+
+    $markerTrashRoot = Join-Path $MarkerRoot "Papierkorb"
+    $otherTrashRoot  = Join-Path $OtherRoot "Papierkorb"
+    $movedDirs = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+    # 1) Marker-Dateien aus dem Dateiindex auswerten
+    foreach ($entry in $MarkerIndex.GetEnumerator()) {
+        $markerFile = $entry.Value
+        if (-not $markerFile.Name.StartsWith('__')) { continue }
+        if ($markerFile.FullName.StartsWith($markerTrashRoot)) { continue }
+        if (Test-IsExcluded $markerFile.FullName) { continue }
+
+        $markerRel = $markerFile.FullName.Substring($MarkerRoot.Length)
+        $unmarkedRel = Get-UnmarkedRelativePath -RelativePath $markerRel
+        if (-not $unmarkedRel) { continue }
+
+        $otherOriginal = Join-Path $OtherRoot $unmarkedRel
+        if (-not (Test-Path -LiteralPath $otherOriginal -PathType Leaf)) { continue }
+
+        if (Test-FileLocked $otherOriginal) {
+            Write-Log "LOCKED TARGET (remote Papierkorb skipped): $unmarkedRel [$Label]" -Level WARN
+            continue
+        }
+
+        $otherTrashPath = Join-Path $otherTrashRoot $markerRel
+        $targetDir = Split-Path $otherTrashPath
+        New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+
+        $ok = Invoke-WithRetry -Description "Remote Papierkorb Datei [$Label]: $unmarkedRel" -Action {
+            Move-Item -LiteralPath $otherOriginal -Destination $otherTrashPath -Force -ErrorAction Stop
+        }
+        if ($ok) {
+            Write-Log "REMOTE PAPIERKORB (Datei) [$Label]: $unmarkedRel -> Papierkorb/$markerRel"
+            $OtherIndex.Remove($unmarkedRel.ToLower()) | Out-Null
+            $Stats.Deleted++
+        }
+    }
+
+    # 2) Marker-Ordner direkt aus Dateisystem lesen (auch leere Ordner)
+    try {
+        $markerDirs = Get-ChildItem $MarkerRoot -Recurse -Directory -ErrorAction Stop |
+                      Sort-Object { $_.FullName.Length }
+    }
+    catch {
+        Write-Log "Kann Marker-Ordner nicht lesen: $MarkerRoot - $_" -Level WARN
+        $markerDirs = @()
+    }
+
+    foreach ($dir in $markerDirs) {
+        if (-not $dir.Name.StartsWith('__')) { continue }
+        if ($dir.FullName.StartsWith($markerTrashRoot)) { continue }
+        if (Test-IsExcluded $dir.FullName) { continue }
+
+        $markerRel = $dir.FullName.Substring($MarkerRoot.Length)
+        $unmarkedRel = Get-UnmarkedRelativePath -RelativePath $markerRel
+        if (-not $unmarkedRel) { continue }
+
+        $otherOriginalDir = Join-Path $OtherRoot $unmarkedRel
+        if (-not (Test-Path -LiteralPath $otherOriginalDir -PathType Container)) { continue }
+
+        # Wenn ein Parent-Ordner bereits verschoben wurde, Child ueberspringen
+        $skip = $false
+        foreach ($md in $movedDirs) {
+            if ($otherOriginalDir.StartsWith($md + '\')) { $skip = $true; break }
+        }
+        if ($skip) { continue }
+
+        $otherTrashPath = Join-Path $otherTrashRoot $markerRel
+        $targetDir = Split-Path $otherTrashPath
+        New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+
+        $ok = Invoke-WithRetry -Description "Remote Papierkorb Ordner [$Label]: $unmarkedRel" -Action {
+            Move-Item -LiteralPath $otherOriginalDir -Destination $otherTrashPath -Force -ErrorAction Stop
+        }
+        if ($ok) {
+            Write-Log "REMOTE PAPIERKORB (Ordner) [$Label]: $unmarkedRel -> Papierkorb/$markerRel"
+            $movedDirs.Add($otherOriginalDir) | Out-Null
+
+            $prefix = ($unmarkedRel.ToLower() + '\')
+            $keys = @($OtherIndex.Keys)
+            foreach ($k in $keys) {
+                if ($k.StartsWith($prefix)) { $OtherIndex.Remove($k) | Out-Null }
+            }
+            $Stats.Deleted++
+        }
+    }
+}
+
 function Move-ToTrash {
     <#
         Verschiebt Ordner und Dateien mit __ am Anfang des Namens
@@ -517,6 +641,10 @@ try {
     Write-Log "Scanne Verzeichnis B: $PathB"
     $indexB = Build-FileIndex -Root $PathB
     Write-Log "Index B: $($indexB.Count) Dateien"
+
+    # "__"-Marker bidirektional auf Gegenseite anwenden (bevor lokale Marker entsorgt werden)
+    Invoke-RemoteTrashFromMarkers -MarkerRoot $PathA -OtherRoot $PathB -MarkerIndex $indexA -OtherIndex $indexB -Label "A->B"
+    Invoke-RemoteTrashFromMarkers -MarkerRoot $PathB -OtherRoot $PathA -MarkerIndex $indexB -OtherIndex $indexA -Label "B->A"
 
     # Dateien mit __ im Namen in Papierkorb verschieben (entfernt Keys aus Index)
     Move-ToTrash -SyncRoot $PathA -FileIndex $indexA
