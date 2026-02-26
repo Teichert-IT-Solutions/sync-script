@@ -240,6 +240,39 @@ function Build-FileIndex {
     return $index
 }
 
+function Build-DirectoryIndex {
+    <#
+        Scannt ein Verzeichnis einmalig und gibt eine Hashtable zurueck:
+        Key = relativer Verzeichnis-Pfad (lowercase), Value = relativer Pfad (Originalschreibweise).
+        Damit werden auch leere Verzeichnisse synchronisiert.
+    #>
+    param([string]$Root)
+
+    if (-not $Root.EndsWith('\')) { $Root += '\' }
+    $index = @{}
+
+    $trashRoot = Join-Path $Root "Papierkorb"
+
+    try {
+        $dirs = Get-ChildItem $Root -Recurse -Directory -ErrorAction Stop
+    }
+    catch {
+        Write-Log "Kann Verzeichnisse nicht lesen: $Root - $_" -Level ERROR
+        return $index
+    }
+
+    foreach ($d in $dirs) {
+        if ($d.FullName.StartsWith($trashRoot)) { continue }
+        if (Test-IsExcluded $d.FullName) { continue }
+
+        $rel = $d.FullName.Substring($Root.Length)
+        if ([string]::IsNullOrWhiteSpace($rel)) { continue }
+        $index[$rel.ToLower()] = $rel
+    }
+
+    return $index
+}
+
 # -- Papierkorb -------------------------------------------------
 
 function Get-UnmarkedRelativePath {
@@ -557,6 +590,40 @@ function Sync-Folders {
     }
 }
 
+function Sync-Directories {
+    <#
+        Erstellt fehlende Verzeichnisse im Ziel (auch wenn sie leer sind).
+    #>
+    param(
+        [string]$Source,
+        [string]$Target,
+        [string]$Label,
+        [hashtable]$SourceDirIndex,
+        [hashtable]$TargetDirIndex
+    )
+
+    Write-Log "-- Sync Verzeichnisse $Label : $Source -> $Target --"
+
+    if (-not $Source.EndsWith('\')) { $Source += '\' }
+    if (-not $Target.EndsWith('\')) { $Target += '\' }
+
+    foreach ($entry in $SourceDirIndex.GetEnumerator()) {
+        $relKey = $entry.Key
+        $relativeDir = $entry.Value
+
+        if ($TargetDirIndex.ContainsKey($relKey)) { continue }
+
+        $targetDir = Join-Path $Target $relativeDir
+        $ok = Invoke-WithRetry -Description "Create directory $relativeDir" -Action {
+            New-Item -ItemType Directory -Path $targetDir -Force -ErrorAction Stop | Out-Null
+        }
+        if ($ok) {
+            Write-Log "DIR CREATED ($Label): $relativeDir"
+            $TargetDirIndex[$relKey] = $relativeDir
+        }
+    }
+}
+
 function Remove-OrphanedFiles {
     <#
         Entfernt Dateien im Ziel, die in der Quelle nicht mehr existieren.
@@ -667,6 +734,12 @@ try {
     # Dateien mit __ im Namen in Papierkorb verschieben (entfernt Keys aus Index)
     Move-ToTrash -SyncRoot $PathA -FileIndex $indexA
     Move-ToTrash -SyncRoot $PathB -FileIndex $indexB
+
+    # Verzeichnisse separat synchronisieren, damit auch leere Ordner uebertragen werden
+    $dirIndexA = Build-DirectoryIndex -Root $PathA
+    $dirIndexB = Build-DirectoryIndex -Root $PathB
+    Sync-Directories -Source $PathA -Target $PathB -Label "A->B" -SourceDirIndex $dirIndexA -TargetDirIndex $dirIndexB
+    Sync-Directories -Source $PathB -Target $PathA -Label "B->A" -SourceDirIndex $dirIndexB -TargetDirIndex $dirIndexA
 
     # Bidirektionaler Sync mit vorberechneten Indizes
     Sync-Folders -Source $PathA -Target $PathB -Label "A->B" -SourceIndex $indexA -TargetIndex $indexB
