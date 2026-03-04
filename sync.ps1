@@ -20,6 +20,7 @@ param(
     [string]$BackupRoot,
     [string]$ConflictRoot,
     [string]$LogFile,
+    [string]$ProgressFile,
 
     [int]$MaxRetries = 3,
     [int]$RetryDelaySeconds = 2,
@@ -68,6 +69,7 @@ if (-not $ScriptDir) {
 if (-not $BackupRoot)   { $BackupRoot   = Join-Path $ScriptDir "_SyncBackup" }
 if (-not $ConflictRoot) { $ConflictRoot = Join-Path $ScriptDir "_SyncConflicts" }
 if (-not $LogFile)      { $LogFile      = Join-Path $ScriptDir "sync_log.txt" }
+if (-not $ProgressFile) { $ProgressFile = Join-Path $ScriptDir "sync_progress.txt" }
 
 # -- Interne Variablen ----------------------------------------
 $TimeStamp      = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
@@ -84,12 +86,21 @@ $ExcludeFolders = @(
 # Dateien, die nie synchronisiert/verschoben/gesichert werden sollen
 $ExcludeFileNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 $ExcludeFileNames.Add('sync_log.txt') | Out-Null
+$ExcludeFileNames.Add('sync_progress.txt') | Out-Null
 if ($LogFile) {
     $logLeaf = Split-Path $LogFile -Leaf
     if (-not [string]::IsNullOrWhiteSpace($logLeaf)) {
         $ExcludeFileNames.Add($logLeaf) | Out-Null
     }
 }
+if ($ProgressFile) {
+    $progressLeaf = Split-Path $ProgressFile -Leaf
+    if (-not [string]::IsNullOrWhiteSpace($progressLeaf)) {
+        $ExcludeFileNames.Add($progressLeaf) | Out-Null
+    }
+}
+
+$script:LastProgressPercent = -1
 
 # -- Hilfsfunktionen ------------------------------------------
 
@@ -111,6 +122,65 @@ function Write-Log {
         "ERROR" { Write-Error $Text -ErrorAction Continue }
         default { Write-Verbose $Text }
     }
+}
+
+function Initialize-ProgressFile {
+    try {
+        $dir = Split-Path -Path $ProgressFile -Parent
+        if (-not [string]::IsNullOrWhiteSpace($dir)) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        }
+        # Vor jedem Lauf leeren und neu befuellen
+        Set-Content -Path $ProgressFile -Value @() -Encoding UTF8 -ErrorAction Stop
+        $script:LastProgressPercent = -1
+    }
+    catch {
+        Write-Log "Progress-Datei kann nicht initialisiert werden: $ProgressFile - $_" -Level WARN
+    }
+}
+
+function Write-ProgressState {
+    param(
+        [double]$Percent,
+        [string]$Phase = "",
+        [switch]$Force
+    )
+
+    $p = [int][Math]::Floor($Percent)
+    if ($p -lt 0)   { $p = 0 }
+    if ($p -gt 100) { $p = 100 }
+
+    if (-not $Force -and $p -le $script:LastProgressPercent) { return }
+
+    $script:LastProgressPercent = $p
+    $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | $p% | $Phase"
+    try {
+        Add-Content -Path $ProgressFile -Value $line -Encoding UTF8 -ErrorAction Stop
+    }
+    catch {
+        Write-Log "Progress-Schreiben fehlgeschlagen: $ProgressFile - $_" -Level WARN
+    }
+}
+
+function Update-ProgressRange {
+    param(
+        [int]$Current,
+        [int]$Total,
+        [double]$RangeStart,
+        [double]$RangeEnd,
+        [string]$Phase
+    )
+
+    if ($Total -le 0) {
+        Write-ProgressState -Percent $RangeEnd -Phase $Phase
+        return
+    }
+
+    $ratio = $Current / [double]$Total
+    if ($ratio -lt 0) { $ratio = 0 }
+    if ($ratio -gt 1) { $ratio = 1 }
+    $pct = $RangeStart + (($RangeEnd - $RangeStart) * $ratio)
+    Write-ProgressState -Percent $pct -Phase $Phase
 }
 
 function Get-HashSafe {
@@ -504,7 +574,9 @@ function Sync-Folders {
         [string]$Target,
         [string]$Label,
         [hashtable]$SourceIndex,
-        [hashtable]$TargetIndex
+        [hashtable]$TargetIndex,
+        [double]$ProgressStart = -1,
+        [double]$ProgressEnd = -1
     )
 
     Write-Log "-- Sync $Label : $Source -> $Target --"
@@ -512,7 +584,15 @@ function Sync-Folders {
     if (-not $Source.EndsWith('\')) { $Source += '\' }
     if (-not $Target.EndsWith('\')) { $Target += '\' }
 
+    $totalItems = $SourceIndex.Count
+    $currentItem = 0
+
     foreach ($entry in $SourceIndex.GetEnumerator()) {
+        $currentItem++
+        if ($ProgressStart -ge 0 -and $ProgressEnd -ge 0) {
+            Update-ProgressRange -Current $currentItem -Total $totalItems -RangeStart $ProgressStart -RangeEnd $ProgressEnd -Phase "Dateisync $Label"
+        }
+
         $relKey  = $entry.Key
         $file    = $entry.Value
         $relativePath = $file.FullName.Substring($Source.Length)
@@ -720,6 +800,8 @@ function Assert-Prerequisites {
 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
 Assert-Prerequisites
+Initialize-ProgressFile
+Write-ProgressState -Percent 0 -Phase "Start" -Force
 
 Write-Log "===== SYNC START ($TimeStamp) ====="
 if ($FolderName) { Write-Log "Sync-Ordner: $FolderName" }
@@ -730,28 +812,33 @@ try {
     Write-Log "Scanne Verzeichnis A: $PathA"
     $indexA = Build-FileIndex -Root $PathA
     Write-Log "Index A: $($indexA.Count) Dateien"
+    Write-ProgressState -Percent 10 -Phase "Scan A abgeschlossen"
 
     Write-Log "Scanne Verzeichnis B: $PathB"
     $indexB = Build-FileIndex -Root $PathB
     Write-Log "Index B: $($indexB.Count) Dateien"
+    Write-ProgressState -Percent 20 -Phase "Scan B abgeschlossen"
 
     # "__"-Marker bidirektional auf Gegenseite anwenden (bevor lokale Marker entsorgt werden)
     Invoke-RemoteTrashFromMarkers -MarkerRoot $PathA -OtherRoot $PathB -MarkerIndex $indexA -OtherIndex $indexB -Label "A->B"
     Invoke-RemoteTrashFromMarkers -MarkerRoot $PathB -OtherRoot $PathA -MarkerIndex $indexB -OtherIndex $indexA -Label "B->A"
+    Write-ProgressState -Percent 30 -Phase "Markerabgleich abgeschlossen"
 
     # Dateien mit __ im Namen in Papierkorb verschieben (entfernt Keys aus Index)
     Move-ToTrash -SyncRoot $PathA -FileIndex $indexA
     Move-ToTrash -SyncRoot $PathB -FileIndex $indexB
+    Write-ProgressState -Percent 40 -Phase "Papierkorb-Phase abgeschlossen"
 
     # Verzeichnisse separat synchronisieren, damit auch leere Ordner uebertragen werden
     $dirIndexA = Build-DirectoryIndex -Root $PathA
     $dirIndexB = Build-DirectoryIndex -Root $PathB
     Sync-Directories -Source $PathA -Target $PathB -Label "A->B" -SourceDirIndex $dirIndexA -TargetDirIndex $dirIndexB
     Sync-Directories -Source $PathB -Target $PathA -Label "B->A" -SourceDirIndex $dirIndexB -TargetDirIndex $dirIndexA
+    Write-ProgressState -Percent 50 -Phase "Verzeichnissync abgeschlossen"
 
     # Bidirektionaler Sync mit vorberechneten Indizes
-    Sync-Folders -Source $PathA -Target $PathB -Label "A->B" -SourceIndex $indexA -TargetIndex $indexB
-    Sync-Folders -Source $PathB -Target $PathA -Label "B->A" -SourceIndex $indexB -TargetIndex $indexA
+    Sync-Folders -Source $PathA -Target $PathB -Label "A->B" -SourceIndex $indexA -TargetIndex $indexB -ProgressStart 50 -ProgressEnd 75
+    Sync-Folders -Source $PathB -Target $PathA -Label "B->A" -SourceIndex $indexB -TargetIndex $indexA -ProgressStart 75 -ProgressEnd 98
 
     # Optional: verwaiste Dateien aufraeumen (auskommentiert - bewusst aktivieren!)
     # Remove-OrphanedFiles -Source $PathA -Target $PathB
@@ -759,9 +846,11 @@ try {
 
     # Alte Backups aufraeumen
     Remove-OldBackups
+    Write-ProgressState -Percent 100 -Phase "Fertig"
 }
 catch {
     Write-Log "UNERWARTETER FEHLER: $_" -Level ERROR
+    Write-ProgressState -Percent $script:LastProgressPercent -Phase "Fehler aufgetreten" -Force
     $Stats.Errors++
 }
 
