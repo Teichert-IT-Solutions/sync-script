@@ -70,6 +70,7 @@ if (-not $BackupRoot)   { $BackupRoot   = Join-Path $ScriptDir "_SyncBackup" }
 if (-not $ConflictRoot) { $ConflictRoot = Join-Path $ScriptDir "_SyncConflicts" }
 if (-not $LogFile)      { $LogFile      = Join-Path $ScriptDir "sync_log.txt" }
 if (-not $ProgressFile) { $ProgressFile = Join-Path $ScriptDir "sync_progress.txt" }
+$RunLockFile = Join-Path $ScriptDir "sync.lock"
 
 # -- Interne Variablen ----------------------------------------
 $TimeStamp      = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
@@ -101,6 +102,7 @@ if ($ProgressFile) {
 }
 
 $script:LastProgressPercent = -1
+$script:RunLockHandle = $null
 
 # -- Hilfsfunktionen ------------------------------------------
 
@@ -112,7 +114,7 @@ function Write-Log {
     )
     $entry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [$Level] $Text"
     try {
-        Add-Content -Path $LogFile -Value $entry -ErrorAction Stop
+        Add-Content -LiteralPath $LogFile -Value $entry -ErrorAction Stop
     }
     catch {
         Write-Warning "Log-Schreiben fehlgeschlagen: $_"
@@ -124,6 +126,74 @@ function Write-Log {
     }
 }
 
+function Get-ErrorHint {
+    param([System.Management.Automation.ErrorRecord]$ErrorRecord)
+
+    if ($null -eq $ErrorRecord) { return "Keine Details verfuegbar." }
+
+    $msg = $ErrorRecord.Exception.Message
+    if ([string]::IsNullOrWhiteSpace($msg)) { $msg = "$ErrorRecord" }
+
+    if ($msg -match "Platzhalterzeichenmuster ist ung.*ltig") {
+        return "Pfad enthaelt Wildcard-Zeichen wie [](). Verwende LiteralPath statt Path."
+    }
+    if ($msg -match "Eigenschaft .Hash. wurde.*nicht gefunden") {
+        return "Hash konnte nicht ausgelesen werden (OneDrive/Provider/Dateizugriff). Datei lokal verfuegbar machen und erneut versuchen."
+    }
+    if ($msg -match "Unerwarteter Netzwerkfehler|Netzwerk") {
+        return "Netzwerkpfad ist instabil oder kurzzeitig nicht erreichbar."
+    }
+    if ($msg -match "wird von einem anderen Prozess verwendet|Zugriff verweigert|access is denied") {
+        return "Datei ist gesperrt oder Berechtigung fehlt."
+    }
+    if ($msg -match "Der Pfad.*nicht gefunden|cannot find path") {
+        return "Pfad existiert nicht mehr oder wurde waehrend des Laufs verschoben."
+    }
+    return "Details im Exception-Text pruefen."
+}
+
+function Format-ErrorDetails {
+    param(
+        [string]$Code,
+        [string]$Operation,
+        [string]$Path,
+        [System.Management.Automation.ErrorRecord]$ErrorRecord
+    )
+
+    $raw = if ($null -eq $ErrorRecord) { "Unbekannt" } else { $ErrorRecord.Exception.Message }
+    $hint = Get-ErrorHint -ErrorRecord $ErrorRecord
+    return "[$Code] Operation=$Operation | Path=$Path | Ursache=$raw | Hinweis=$hint"
+}
+
+function Acquire-RunLock {
+    param([string]$LockPath)
+
+    try {
+        $script:RunLockHandle = [System.IO.File]::Open($LockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        $lockContent = "pid=$PID`nstarted=$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`npathA=$PathA`npathB=$PathB"
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($lockContent)
+        $script:RunLockHandle.SetLength(0)
+        $script:RunLockHandle.Write($bytes, 0, $bytes.Length)
+        $script:RunLockHandle.Flush()
+        return $true
+    }
+    catch {
+        Write-Log (Format-ErrorDetails -Code "E_LOCK_ACTIVE" -Operation "AcquireRunLock" -Path $LockPath -ErrorRecord $_) -Level ERROR
+        return $false
+    }
+}
+
+function Release-RunLock {
+    param([string]$LockPath)
+
+    if ($null -ne $script:RunLockHandle) {
+        try { $script:RunLockHandle.Close() } catch {}
+        try { $script:RunLockHandle.Dispose() } catch {}
+        $script:RunLockHandle = $null
+    }
+    try { Remove-Item -LiteralPath $LockPath -Force -ErrorAction SilentlyContinue } catch {}
+}
+
 function Initialize-ProgressFile {
     try {
         $dir = Split-Path -Path $ProgressFile -Parent
@@ -131,7 +201,7 @@ function Initialize-ProgressFile {
             New-Item -ItemType Directory -Path $dir -Force | Out-Null
         }
         # Vor jedem Lauf leeren und neu befuellen
-        Set-Content -Path $ProgressFile -Value @() -Encoding UTF8 -ErrorAction Stop
+        Set-Content -LiteralPath $ProgressFile -Value @() -Encoding UTF8 -ErrorAction Stop
         $script:LastProgressPercent = -1
     }
     catch {
@@ -155,7 +225,7 @@ function Write-ProgressState {
     $script:LastProgressPercent = $p
     $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | $p% | $Phase"
     try {
-        Add-Content -Path $ProgressFile -Value $line -Encoding UTF8 -ErrorAction Stop
+        Add-Content -LiteralPath $ProgressFile -Value $line -Encoding UTF8 -ErrorAction Stop
     }
     catch {
         Write-Log "Progress-Schreiben fehlgeschlagen: $ProgressFile - $_" -Level WARN
@@ -186,17 +256,17 @@ function Update-ProgressRange {
 function Get-HashSafe {
     param([string]$Path)
     try {
-        return (Get-FileHash -Algorithm SHA256 -Path $Path -ErrorAction Stop).Hash
+        return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path -ErrorAction Stop).Hash
     }
     catch {
-        Write-Log "Hash-Berechnung fehlgeschlagen: $Path - $_" -Level WARN
+        Write-Log (Format-ErrorDetails -Code "E_HASH" -Operation "GetFileHash" -Path $Path -ErrorRecord $_) -Level WARN
         return $null
     }
 }
 
 function Test-FileLocked {
     param([string]$Path)
-    if (-not (Test-Path $Path)) { return $false }
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
     try {
         $stream = [System.IO.File]::Open($Path, 'Open', 'ReadWrite', 'None')
         $stream.Close()
@@ -220,11 +290,11 @@ function Invoke-WithRetry {
         }
         catch {
             if ($i -lt $MaxRetries) {
-                Write-Log "Retry $i von $MaxRetries fuer $Description : $_" -Level WARN
+                Write-Log (Format-ErrorDetails -Code "E_RETRY" -Operation "$Description (Retry $i/$MaxRetries)" -Path "-" -ErrorRecord $_) -Level WARN
                 Start-Sleep -Seconds $RetryDelaySeconds
             }
             else {
-                Write-Log "Fehlgeschlagen nach $MaxRetries Versuchen - $Description : $_" -Level ERROR
+                Write-Log (Format-ErrorDetails -Code "E_ACTION_FAILED" -Operation "$Description (Final Retry)" -Path "-" -ErrorRecord $_) -Level ERROR
                 $Stats.Errors++
                 return $false
             }
@@ -243,7 +313,7 @@ function Backup-File {
     $dir = Split-Path $backupPath
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
     Invoke-WithRetry -Description "Backup $RelativePath" -Action {
-        Copy-Item $FilePath $backupPath -Force -ErrorAction Stop
+        Copy-Item -LiteralPath $FilePath -Destination $backupPath -Force -ErrorAction Stop
     } | Out-Null
 }
 
@@ -260,8 +330,8 @@ function Handle-Conflict {
     New-Item -ItemType Directory -Path (Split-Path $conflictA) -Force | Out-Null
     New-Item -ItemType Directory -Path (Split-Path $conflictB) -Force | Out-Null
 
-    Copy-Item $FileA $conflictA -Force
-    Copy-Item $FileB $conflictB -Force
+    Copy-Item -LiteralPath $FileA -Destination $conflictA -Force -ErrorAction Stop
+    Copy-Item -LiteralPath $FileB -Destination $conflictB -Force -ErrorAction Stop
 
     Write-Log "CONFLICT: $RelativePath" -Level WARN
     $Stats.Conflicts++
@@ -295,7 +365,7 @@ function Build-FileIndex {
     $index = @{}
 
     try {
-        $files = Get-ChildItem $Root -Recurse -File -ErrorAction Stop
+        $files = Get-ChildItem -LiteralPath $Root -Recurse -File -ErrorAction Stop
     }
     catch {
         Write-Log "Kann Verzeichnis nicht lesen: $Root - $_" -Level ERROR
@@ -324,7 +394,7 @@ function Build-DirectoryIndex {
     $trashRoot = Join-Path $Root "Papierkorb"
 
     try {
-        $dirs = Get-ChildItem $Root -Recurse -Directory -ErrorAction Stop
+        $dirs = Get-ChildItem -LiteralPath $Root -Recurse -Directory -ErrorAction Stop
     }
     catch {
         Write-Log "Kann Verzeichnisse nicht lesen: $Root - $_" -Level ERROR
@@ -421,7 +491,7 @@ function Invoke-RemoteTrashFromMarkers {
 
     # 2) Marker-Ordner direkt aus Dateisystem lesen (auch leere Ordner)
     try {
-        $markerDirs = Get-ChildItem $MarkerRoot -Recurse -Directory -ErrorAction Stop |
+        $markerDirs = Get-ChildItem -LiteralPath $MarkerRoot -Recurse -Directory -ErrorAction Stop |
                       Sort-Object { $_.FullName.Length }
     }
     catch {
@@ -488,7 +558,7 @@ function Move-ToTrash {
 
     # Phase 1: Ordner mit __ am Anfang komplett verschieben
     try {
-        $dirs = Get-ChildItem $SyncRoot -Recurse -Directory -ErrorAction Stop |
+        $dirs = Get-ChildItem -LiteralPath $SyncRoot -Recurse -Directory -ErrorAction Stop |
                 Sort-Object { $_.FullName.Length }
     }
     catch {
@@ -514,7 +584,7 @@ function Move-ToTrash {
             New-Item -ItemType Directory -Path $parentDir -Force | Out-Null
 
             $ok = Invoke-WithRetry -Description "Papierkorb (Ordner): $relativePath" -Action {
-                Move-Item $dir.FullName $trashPath -Force -ErrorAction Stop
+                Move-Item -LiteralPath $dir.FullName -Destination $trashPath -Force -ErrorAction Stop
             }
             if ($ok) {
                 Write-Log "PAPIERKORB (Ordner): $relativePath -> Papierkorb/$relativePath"
@@ -554,7 +624,7 @@ function Move-ToTrash {
             New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
 
             $ok = Invoke-WithRetry -Description "Papierkorb: $relativePath" -Action {
-                Move-Item $file.FullName $trashPath -Force -ErrorAction Stop
+                Move-Item -LiteralPath $file.FullName -Destination $trashPath -Force -ErrorAction Stop
             }
             if ($ok) {
                 Write-Log "PAPIERKORB: $relativePath -> Papierkorb/$relativePath"
@@ -611,7 +681,7 @@ function Sync-Folders {
             New-Item -ItemType Directory -Path $dir -Force | Out-Null
 
             $ok = Invoke-WithRetry -Description "Copy $relativePath" -Action {
-                Copy-Item $file.FullName $targetFile -Force -ErrorAction Stop
+                Copy-Item -LiteralPath $file.FullName -Destination $targetFile -Force -ErrorAction Stop
             }
             if ($ok) {
                 Write-Log "COPIED: $relativePath"
@@ -659,7 +729,7 @@ function Sync-Folders {
                 if ($file.LastWriteTime -gt $targetItem.LastWriteTime) {
                     Backup-File $targetFile $relativePath
                     $ok = Invoke-WithRetry -Description "Update $relativePath" -Action {
-                        Copy-Item $file.FullName $targetFile -Force -ErrorAction Stop
+                        Copy-Item -LiteralPath $file.FullName -Destination $targetFile -Force -ErrorAction Stop
                     }
                     if ($ok) {
                         Write-Log "UPDATED (Source newer): $relativePath"
@@ -726,7 +796,7 @@ function Remove-OrphanedFiles {
     if (-not $Target.EndsWith('\')) { $Target += '\' }
 
     try {
-        $targetFiles = Get-ChildItem $Target -Recurse -File -ErrorAction Stop
+        $targetFiles = Get-ChildItem -LiteralPath $Target -Recurse -File -ErrorAction Stop
     }
     catch { return }
 
@@ -736,13 +806,13 @@ function Remove-OrphanedFiles {
         $relativePath = $tf.FullName.Substring($Target.Length)
         $sourceFile   = Join-Path $Source $relativePath
 
-        if (-not (Test-Path $sourceFile)) {
+        if (-not (Test-Path -LiteralPath $sourceFile)) {
             $otherSide = if ($Target -eq $PathA) { $PathB } else { $PathA }
             $otherFile = Join-Path $otherSide $relativePath
 
-            if (-not (Test-Path $otherFile)) {
+            if (-not (Test-Path -LiteralPath $otherFile)) {
                 Backup-File $tf.FullName $relativePath
-                Remove-Item $tf.FullName -Force -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath $tf.FullName -Force -ErrorAction SilentlyContinue
                 Write-Log "DELETED (Orphan): $relativePath"
                 $Stats.Deleted++
             }
@@ -754,20 +824,20 @@ function Remove-OldBackups {
     <#
         Loescht Backup-Ordner, die aelter als $BackupRetentionDays Tage sind.
     #>
-    if (-not (Test-Path $BackupRoot)) { return }
+    if (-not (Test-Path -LiteralPath $BackupRoot)) { return }
 
-    Get-ChildItem $BackupRoot -Directory | ForEach-Object {
+    Get-ChildItem -LiteralPath $BackupRoot -Directory | ForEach-Object {
         if ($_.CreationTime -lt (Get-Date).AddDays(-$BackupRetentionDays)) {
-            Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
             Write-Log "BACKUP CLEANUP: $($_.Name) removed (older than $BackupRetentionDays days)"
         }
     }
 
-    if (-not (Test-Path $ConflictRoot)) { return }
+    if (-not (Test-Path -LiteralPath $ConflictRoot)) { return }
 
-    Get-ChildItem $ConflictRoot -Directory | ForEach-Object {
+    Get-ChildItem -LiteralPath $ConflictRoot -Directory | ForEach-Object {
         if ($_.CreationTime -lt (Get-Date).AddDays(-$BackupRetentionDays)) {
-            Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
             Write-Log "CONFLICT CLEANUP: $($_.Name) removed"
         }
     }
@@ -778,11 +848,11 @@ function Remove-OldBackups {
 function Assert-Prerequisites {
     $ok = $true
 
-    if (-not (Test-Path $PathA)) {
+    if (-not (Test-Path -LiteralPath $PathA)) {
         Write-Log "FATAL: Pfad A nicht erreichbar: $PathA" -Level ERROR
         $ok = $false
     }
-    if (-not (Test-Path $PathB)) {
+    if (-not (Test-Path -LiteralPath $PathB)) {
         Write-Log "FATAL: Pfad B nicht erreichbar: $PathB" -Level ERROR
         $ok = $false
     }
@@ -798,60 +868,74 @@ function Assert-Prerequisites {
 # -- Hauptablauf -----------------------------------------------
 
 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-
-Assert-Prerequisites
-Initialize-ProgressFile
-Write-ProgressState -Percent 0 -Phase "Start" -Force
-
-Write-Log "===== SYNC START ($TimeStamp) ====="
-if ($FolderName) { Write-Log "Sync-Ordner: $FolderName" }
-Write-Log "PathA=$PathA | PathB=$PathB | Retries=$MaxRetries | Retention=${BackupRetentionDays}d"
-
+$lockAcquired = $false
 try {
-    # Beide Seiten einmalig scannen und indexieren
-    Write-Log "Scanne Verzeichnis A: $PathA"
-    $indexA = Build-FileIndex -Root $PathA
-    Write-Log "Index A: $($indexA.Count) Dateien"
-    Write-ProgressState -Percent 10 -Phase "Scan A abgeschlossen"
+    Assert-Prerequisites
 
-    Write-Log "Scanne Verzeichnis B: $PathB"
-    $indexB = Build-FileIndex -Root $PathB
-    Write-Log "Index B: $($indexB.Count) Dateien"
-    Write-ProgressState -Percent 20 -Phase "Scan B abgeschlossen"
+    $lockAcquired = Acquire-RunLock -LockPath $RunLockFile
+    if (-not $lockAcquired) {
+        Write-Error "Sync bereits aktiv oder Lock-Datei nicht verfuegbar: $RunLockFile"
+        exit 1
+    }
 
-    # "__"-Marker bidirektional auf Gegenseite anwenden (bevor lokale Marker entsorgt werden)
-    Invoke-RemoteTrashFromMarkers -MarkerRoot $PathA -OtherRoot $PathB -MarkerIndex $indexA -OtherIndex $indexB -Label "A->B"
-    Invoke-RemoteTrashFromMarkers -MarkerRoot $PathB -OtherRoot $PathA -MarkerIndex $indexB -OtherIndex $indexA -Label "B->A"
-    Write-ProgressState -Percent 30 -Phase "Markerabgleich abgeschlossen"
+    Initialize-ProgressFile
+    Write-ProgressState -Percent 0 -Phase "Start" -Force
 
-    # Dateien mit __ im Namen in Papierkorb verschieben (entfernt Keys aus Index)
-    Move-ToTrash -SyncRoot $PathA -FileIndex $indexA
-    Move-ToTrash -SyncRoot $PathB -FileIndex $indexB
-    Write-ProgressState -Percent 40 -Phase "Papierkorb-Phase abgeschlossen"
+    Write-Log "===== SYNC START ($TimeStamp) ====="
+    if ($FolderName) { Write-Log "Sync-Ordner: $FolderName" }
+    Write-Log "PathA=$PathA | PathB=$PathB | Retries=$MaxRetries | Retention=${BackupRetentionDays}d"
 
-    # Verzeichnisse separat synchronisieren, damit auch leere Ordner uebertragen werden
-    $dirIndexA = Build-DirectoryIndex -Root $PathA
-    $dirIndexB = Build-DirectoryIndex -Root $PathB
-    Sync-Directories -Source $PathA -Target $PathB -Label "A->B" -SourceDirIndex $dirIndexA -TargetDirIndex $dirIndexB
-    Sync-Directories -Source $PathB -Target $PathA -Label "B->A" -SourceDirIndex $dirIndexB -TargetDirIndex $dirIndexA
-    Write-ProgressState -Percent 50 -Phase "Verzeichnissync abgeschlossen"
+    try {
+        # Beide Seiten einmalig scannen und indexieren
+        Write-Log "Scanne Verzeichnis A: $PathA"
+        $indexA = Build-FileIndex -Root $PathA
+        Write-Log "Index A: $($indexA.Count) Dateien"
+        Write-ProgressState -Percent 10 -Phase "Scan A abgeschlossen"
 
-    # Bidirektionaler Sync mit vorberechneten Indizes
-    Sync-Folders -Source $PathA -Target $PathB -Label "A->B" -SourceIndex $indexA -TargetIndex $indexB -ProgressStart 50 -ProgressEnd 75
-    Sync-Folders -Source $PathB -Target $PathA -Label "B->A" -SourceIndex $indexB -TargetIndex $indexA -ProgressStart 75 -ProgressEnd 98
+        Write-Log "Scanne Verzeichnis B: $PathB"
+        $indexB = Build-FileIndex -Root $PathB
+        Write-Log "Index B: $($indexB.Count) Dateien"
+        Write-ProgressState -Percent 20 -Phase "Scan B abgeschlossen"
 
-    # Optional: verwaiste Dateien aufraeumen (auskommentiert - bewusst aktivieren!)
-    # Remove-OrphanedFiles -Source $PathA -Target $PathB
-    # Remove-OrphanedFiles -Source $PathB -Target $PathA
+        # "__"-Marker bidirektional auf Gegenseite anwenden (bevor lokale Marker entsorgt werden)
+        Invoke-RemoteTrashFromMarkers -MarkerRoot $PathA -OtherRoot $PathB -MarkerIndex $indexA -OtherIndex $indexB -Label "A->B"
+        Invoke-RemoteTrashFromMarkers -MarkerRoot $PathB -OtherRoot $PathA -MarkerIndex $indexB -OtherIndex $indexA -Label "B->A"
+        Write-ProgressState -Percent 30 -Phase "Markerabgleich abgeschlossen"
 
-    # Alte Backups aufraeumen
-    Remove-OldBackups
-    Write-ProgressState -Percent 100 -Phase "Fertig"
+        # Dateien mit __ im Namen in Papierkorb verschieben (entfernt Keys aus Index)
+        Move-ToTrash -SyncRoot $PathA -FileIndex $indexA
+        Move-ToTrash -SyncRoot $PathB -FileIndex $indexB
+        Write-ProgressState -Percent 40 -Phase "Papierkorb-Phase abgeschlossen"
+
+        # Verzeichnisse separat synchronisieren, damit auch leere Ordner uebertragen werden
+        $dirIndexA = Build-DirectoryIndex -Root $PathA
+        $dirIndexB = Build-DirectoryIndex -Root $PathB
+        Sync-Directories -Source $PathA -Target $PathB -Label "A->B" -SourceDirIndex $dirIndexA -TargetDirIndex $dirIndexB
+        Sync-Directories -Source $PathB -Target $PathA -Label "B->A" -SourceDirIndex $dirIndexB -TargetDirIndex $dirIndexA
+        Write-ProgressState -Percent 50 -Phase "Verzeichnissync abgeschlossen"
+
+        # Bidirektionaler Sync mit vorberechneten Indizes
+        Sync-Folders -Source $PathA -Target $PathB -Label "A->B" -SourceIndex $indexA -TargetIndex $indexB -ProgressStart 50 -ProgressEnd 75
+        Sync-Folders -Source $PathB -Target $PathA -Label "B->A" -SourceIndex $indexB -TargetIndex $indexA -ProgressStart 75 -ProgressEnd 98
+
+        # Optional: verwaiste Dateien aufraeumen (auskommentiert - bewusst aktivieren!)
+        # Remove-OrphanedFiles -Source $PathA -Target $PathB
+        # Remove-OrphanedFiles -Source $PathB -Target $PathA
+
+        # Alte Backups aufraeumen
+        Remove-OldBackups
+        Write-ProgressState -Percent 100 -Phase "Fertig"
+    }
+    catch {
+        Write-Log (Format-ErrorDetails -Code "E_UNHANDLED" -Operation "MainSyncLoop" -Path "-" -ErrorRecord $_) -Level ERROR
+        Write-ProgressState -Percent $script:LastProgressPercent -Phase "Fehler aufgetreten" -Force
+        $Stats.Errors++
+    }
 }
-catch {
-    Write-Log "UNERWARTETER FEHLER: $_" -Level ERROR
-    Write-ProgressState -Percent $script:LastProgressPercent -Phase "Fehler aufgetreten" -Force
-    $Stats.Errors++
+finally {
+    if ($lockAcquired) {
+        Release-RunLock -LockPath $RunLockFile
+    }
 }
 
 $stopwatch.Stop()
