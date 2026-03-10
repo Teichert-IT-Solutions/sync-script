@@ -103,8 +103,16 @@ if ($ProgressFile) {
 
 $script:LastProgressPercent = -1
 $script:RunLockHandle = $null
+$script:RunStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+$script:LastProgressWriteAt = [datetime]::MinValue
+$script:ProgressHeartbeatSeconds = 60
 
 # -- Hilfsfunktionen ------------------------------------------
+
+function Get-ElapsedRuntimeString {
+    if ($null -eq $script:RunStopwatch) { return "00:00:00.000" }
+    return $script:RunStopwatch.Elapsed.ToString("hh\:mm\:ss\.fff")
+}
 
 function Write-Log {
     param(
@@ -112,7 +120,8 @@ function Write-Log {
         [ValidateSet("INFO","WARN","ERROR")]
         [string]$Level = "INFO"
     )
-    $entry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [$Level] $Text"
+    $elapsed = Get-ElapsedRuntimeString
+    $entry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [$Level] [t+$elapsed] $Text"
     try {
         Add-Content -LiteralPath $LogFile -Value $entry -ErrorAction Stop
     }
@@ -220,15 +229,37 @@ function Write-ProgressState {
     if ($p -lt 0)   { $p = 0 }
     if ($p -gt 100) { $p = 100 }
 
-    if (-not $Force -and $p -le $script:LastProgressPercent) { return }
+    $now = Get-Date
+    $previousPercent = $script:LastProgressPercent
+    $shouldHeartbeat = $false
+    if ($script:LastProgressWriteAt -ne [datetime]::MinValue) {
+        $secondsSinceLast = ($now - $script:LastProgressWriteAt).TotalSeconds
+        if ($secondsSinceLast -ge $script:ProgressHeartbeatSeconds) {
+            $shouldHeartbeat = $true
+        }
+    }
 
-    $script:LastProgressPercent = $p
-    $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | $p% | $Phase"
+    if (-not $Force -and $p -le $previousPercent -and -not $shouldHeartbeat) { return }
+    if ($p -gt $previousPercent) { $script:LastProgressPercent = $p }
+
+    $elapsed = Get-ElapsedRuntimeString
+    $phaseText = if ([string]::IsNullOrWhiteSpace($Phase)) { "-" } else { $Phase }
+    $heartbeatTag = if ($shouldHeartbeat -and $p -le $previousPercent -and -not $Force) { " | heartbeat" } else { "" }
+    $line = "{0} | {1}% | Laufzeit {2} | {3}{4}" -f $now.ToString('yyyy-MM-dd HH:mm:ss'), $p, $elapsed, $phaseText, $heartbeatTag
     try {
         Add-Content -LiteralPath $ProgressFile -Value $line -Encoding UTF8 -ErrorAction Stop
+        $script:LastProgressWriteAt = $now
     }
     catch {
         Write-Log "Progress-Schreiben fehlgeschlagen: $ProgressFile - $_" -Level WARN
+    }
+
+    $status = "$phaseText | Laufzeit: $elapsed"
+    if ($p -ge 100) {
+        Write-Progress -Activity "Sync" -Status $status -PercentComplete 100 -Completed
+    }
+    else {
+        Write-Progress -Activity "Sync" -Status $status -PercentComplete $p
     }
 }
 
@@ -867,7 +898,7 @@ function Assert-Prerequisites {
 
 # -- Hauptablauf -----------------------------------------------
 
-$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+$stopwatch = $script:RunStopwatch
 $lockAcquired = $false
 try {
     Assert-Prerequisites
@@ -940,10 +971,25 @@ finally {
 
 $stopwatch.Stop()
 $duration = $stopwatch.Elapsed.ToString("hh\:mm\:ss\.fff")
+$resultText = if ($Stats.Errors -gt 0) { "MIT FEHLERN" } else { "ERFOLGREICH" }
 
 Write-Log ("STATISTIK: Copied={0} | Updated={1} | Conflicts={2} | Skipped={3} | Deleted={4} | Errors={5}" -f `
     $Stats.Copied, $Stats.Updated, $Stats.Conflicts, $Stats.Skipped, $Stats.Deleted, $Stats.Errors)
-Write-Log "===== SYNC END (Dauer: $duration) ====="
+Write-Log "===== SYNC END (Status: $resultText | Dauer: $duration) ====="
+
+Write-Host ""
+Write-Host "===== SYNC SUMMARY =====" -ForegroundColor Cyan
+Write-Host ("Status    : {0}" -f $resultText) -ForegroundColor $(if ($Stats.Errors -gt 0) { "Yellow" } else { "Green" })
+Write-Host ("Dauer     : {0}" -f $duration)
+Write-Host ("Copied    : {0}" -f $Stats.Copied)
+Write-Host ("Updated   : {0}" -f $Stats.Updated)
+Write-Host ("Conflicts : {0}" -f $Stats.Conflicts)
+Write-Host ("Skipped   : {0}" -f $Stats.Skipped)
+Write-Host ("Deleted   : {0}" -f $Stats.Deleted)
+Write-Host ("Errors    : {0}" -f $Stats.Errors)
+Write-Host ("Log       : {0}" -f $LogFile)
+Write-Host ("Progress  : {0}" -f $ProgressFile)
+Write-Host "========================"
 
 # Exit-Code: 0 = OK, 1 = mit Fehlern
 if ($Stats.Errors -gt 0) { exit 1 } else { exit 0 }
