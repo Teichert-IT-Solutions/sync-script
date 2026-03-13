@@ -25,7 +25,12 @@ param(
     [int]$MaxRetries = 3,
     [int]$RetryDelaySeconds = 2,
     [int]$BackupRetentionDays = 30,
-    [int]$ConflictTimeTolerance = 2
+    [int]$ConflictTimeTolerance = 2,
+
+    # Performance-Optimierungen (bei 100k+ Dateien)
+    [switch]$TrustSizeAndTimeMatch,  # Hash ueberspringen wenn Groesse+Zeit identisch (deutlich schneller, minimal weniger sicher)
+    [switch]$UseRobocopy,  # Robocopy statt Copy-Item (schneller ueber Netzwerk)
+    [int]$ProgressUpdateInterval = 500  # Progress nur alle N Dateien schreiben (reduziert I/O)
 )
 
 Set-StrictMode -Version Latest
@@ -54,6 +59,9 @@ else {
     Write-Host ""
     Write-Host "  Variante 2 (unterschiedliche Pfade):" -ForegroundColor Yellow
     Write-Host "    .\sync.ps1 -PathA ""Z:\Abteilung\Daten"" -PathB ""Y:\Backup\Projekte""" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  Performance (100k+ Dateien):" -ForegroundColor Yellow
+    Write-Host "    .\sync.ps1 -PathA ... -PathB ... -TrustSizeAndTimeMatch -UseRobocopy" -ForegroundColor Cyan
     Write-Host ""
     exit 1
 }
@@ -287,7 +295,8 @@ function Update-ProgressRange {
 function Get-HashSafe {
     param([string]$Path)
     try {
-        return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path -ErrorAction Stop).Hash
+        # MD5 ist schneller als SHA256 bei gleicher Netzwerk-/Disk-Latenz
+        return (Get-FileHash -Algorithm MD5 -LiteralPath $Path -ErrorAction Stop).Hash
     }
     catch {
         Write-Log (Format-ErrorDetails -Code "E_HASH" -Operation "GetFileHash" -Path $Path -ErrorRecord $_) -Level WARN
@@ -331,6 +340,20 @@ function Invoke-WithRetry {
             }
         }
     }
+}
+
+function Copy-FileFast {
+    param([string]$Source, [string]$Destination)
+    if ($UseRobocopy -and (Get-Command robocopy -ErrorAction SilentlyContinue)) {
+        $srcDir = Split-Path $Source -Parent
+        $dstDir = Split-Path $Destination -Parent
+        $fileName = Split-Path $Source -Leaf
+        & robocopy $srcDir $dstDir $fileName /NP /NFL /NDL /NJH /NJS /R:1 /W:1 *>$null
+        $exitCode = $LASTEXITCODE
+        if ($exitCode -ge 8) { throw "Robocopy failed (Exit $exitCode)" }
+        return
+    }
+    Copy-Item -LiteralPath $Source -Destination $Destination -Force -ErrorAction Stop
 }
 
 function Backup-File {
@@ -690,7 +713,7 @@ function Sync-Folders {
 
     foreach ($entry in $SourceIndex.GetEnumerator()) {
         $currentItem++
-        if ($ProgressStart -ge 0 -and $ProgressEnd -ge 0) {
+        if ($ProgressStart -ge 0 -and $ProgressEnd -ge 0 -and ($currentItem % $ProgressUpdateInterval -eq 0 -or $currentItem -eq $totalItems)) {
             Update-ProgressRange -Current $currentItem -Total $totalItems -RangeStart $ProgressStart -RangeEnd $ProgressEnd -Phase "Dateisync $Label"
         }
 
@@ -712,7 +735,7 @@ function Sync-Folders {
             New-Item -ItemType Directory -Path $dir -Force | Out-Null
 
             $ok = Invoke-WithRetry -Description "Copy $relativePath" -Action {
-                Copy-Item -LiteralPath $file.FullName -Destination $targetFile -Force -ErrorAction Stop
+                Copy-FileFast -Source $file.FullName -Destination $targetFile
             }
             if ($ok) {
                 Write-Log "COPIED: $relativePath"
@@ -722,11 +745,14 @@ function Sync-Folders {
         else {
             # -- Datei existiert auf beiden Seiten --
             $targetItem = $TargetIndex[$relKey]
+            $sizeTimeMatch = ($file.Length -eq $targetItem.Length -and $file.LastWriteTimeUtc -eq $targetItem.LastWriteTimeUtc)
 
-            # Fast-Path nur noch bei exakt gleicher Zeit.
-            # Bei "nahezu gleich" (z.B. gleiche Sekunde) kann Inhalt trotzdem abweichen.
-            if ($file.Length -eq $targetItem.Length -and
-                $file.LastWriteTimeUtc -eq $targetItem.LastWriteTimeUtc) {
+            # Fast-Path: Groesse+Zeit identisch
+            if ($sizeTimeMatch) {
+                if ($TrustSizeAndTimeMatch) {
+                    # Hash ueberspringen -> deutlich schneller bei 100k+ Dateien
+                    continue
+                }
                 $hashSourceFast = Get-HashSafe $file.FullName
                 $hashTargetFast = Get-HashSafe $targetFile
                 if ($null -ne $hashSourceFast -and $hashSourceFast -eq $hashTargetFast) {
@@ -750,8 +776,24 @@ function Sync-Folders {
             $hashTarget = Get-HashSafe $targetFile
 
             if ($null -eq $hashSource -or $null -eq $hashTarget) {
-                Write-Log "HASH ERROR (skipped): $relativePath" -Level WARN
-                $Stats.Skipped++
+                # Fallback: Bei Hash-Fehler (z.B. OneDrive) Groesse+Zeit nutzen
+                if ($sizeTimeMatch) {
+                    continue
+                }
+                if ($file.LastWriteTime -gt $targetItem.LastWriteTime) {
+                    Backup-File $targetFile $relativePath
+                    $ok = Invoke-WithRetry -Description "Update (Hash-Fallback) $relativePath" -Action {
+                        Copy-FileFast -Source $file.FullName -Destination $targetFile
+                    }
+                    if ($ok) {
+                        Write-Log "UPDATED (Source newer, Hash-Fallback): $relativePath"
+                        $Stats.Updated++
+                    }
+                }
+                else {
+                    Write-Log "HASH ERROR (skipped): $relativePath" -Level WARN
+                    $Stats.Skipped++
+                }
                 continue
             }
 
@@ -760,7 +802,7 @@ function Sync-Folders {
                 if ($file.LastWriteTime -gt $targetItem.LastWriteTime) {
                     Backup-File $targetFile $relativePath
                     $ok = Invoke-WithRetry -Description "Update $relativePath" -Action {
-                        Copy-Item -LiteralPath $file.FullName -Destination $targetFile -Force -ErrorAction Stop
+                        Copy-FileFast -Source $file.FullName -Destination $targetFile
                     }
                     if ($ok) {
                         Write-Log "UPDATED (Source newer): $relativePath"
@@ -915,6 +957,8 @@ try {
     Write-Log "===== SYNC START ($TimeStamp) ====="
     if ($FolderName) { Write-Log "Sync-Ordner: $FolderName" }
     Write-Log "PathA=$PathA | PathB=$PathB | Retries=$MaxRetries | Retention=${BackupRetentionDays}d"
+    if ($TrustSizeAndTimeMatch) { Write-Log "TrustSizeAndTimeMatch=AN (Hash wird bei gleicher Groesse+Zeit uebersprungen)" }
+    if ($UseRobocopy) { Write-Log "UseRobocopy=AN (Robocopy fuer Kopien)" }
 
     try {
         # Beide Seiten einmalig scannen und indexieren
